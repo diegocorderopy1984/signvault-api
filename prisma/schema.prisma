@@ -1,0 +1,149 @@
+// SignVault - Prisma Schema
+// PostgreSQL database for digital signature management
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Users ───────────────────────────────────────────────────────────────────
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String   @map("password_hash")
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  signatures   Signature[]
+  auditLogs    AuditLog[]
+
+  @@map("users")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+// ─── Documents ───────────────────────────────────────────────────────────────
+model Document {
+  id           String         @id @default(uuid())
+  originalName String         @map("original_name")
+  storagePath  String         @map("storage_path")       // path on disk / S3
+  sha256Original String       @map("sha256_original")    // hash of original PDF
+  uploadedAt   DateTime       @default(now()) @map("uploaded_at")
+  mimeType     String         @default("application/pdf") @map("mime_type")
+  sizeBytes    Int            @map("size_bytes")
+
+  signatures   Signature[]
+
+  @@map("documents")
+}
+
+// ─── Signatures ──────────────────────────────────────────────────────────────
+model Signature {
+  id              String          @id @default(uuid())
+  verificationCode String         @unique @default(uuid()) @map("verification_code") // UUID v4
+  
+  // Relations
+  userId          String          @map("user_id")
+  user            User            @relation(fields: [userId], references: [id])
+  documentId      String          @map("document_id")
+  document        Document        @relation(fields: [documentId], references: [id])
+
+  // Signed document
+  signedPdfPath   String?         @map("signed_pdf_path")   // path to the signed PDF
+  sha256Signed    String?         @map("sha256_signed")     // hash of the signed PDF
+
+  // Signature image (AES-256 encrypted, stored as base64)
+  signatureDataEncrypted String?  @map("signature_data_encrypted")
+  signatureIv     String?         @map("signature_iv")       // IV for AES decryption
+
+  // Placement
+  signatureX      Float?          @map("signature_x")
+  signatureY      Float?          @map("signature_y")
+  signaturePage   Int?            @default(1) @map("signature_page")
+  signatureWidth  Float?          @map("signature_width")
+  signatureHeight Float?          @map("signature_height")
+
+  // QR
+  qrCodePath      String?         @map("qr_code_path")
+
+  // Timestamps
+  signedAt        DateTime        @default(now()) @map("signed_at")
+
+  // Geolocation
+  latitude        Float?
+  longitude       Float?
+  accuracyMeters  Float?          @map("accuracy_meters")
+  address         String?
+  geoSource       GeoSource       @default(NONE) @map("geo_source")
+
+  // Network / device info
+  ipAddress       String?         @map("ip_address")
+  userAgent       String?         @map("user_agent")
+  deviceInfo      String?         @map("device_info")      // JSON string
+
+  // Status
+  status          SignatureStatus  @default(VALID)
+
+  verifications   Verification[]
+  auditLogs       AuditLog[]
+
+  @@map("signatures")
+}
+
+enum GeoSource {
+  GPS        // Browser high-accuracy GPS
+  IP         // IP-based fallback
+  NONE
+}
+
+enum SignatureStatus {
+  VALID
+  REVOKED
+  TAMPERED
+}
+
+// ─── Verifications (audit log of each QR scan / check) ───────────────────────
+model Verification {
+  id              String    @id @default(uuid())
+  signatureId     String    @map("signature_id")
+  signature       Signature @relation(fields: [signatureId], references: [id])
+
+  verifiedAt      DateTime  @default(now()) @map("verified_at")
+  ipAddress       String?   @map("ip_address")
+  userAgent       String?   @map("user_agent")
+  result          VerificationResult
+
+  @@map("verifications")
+}
+
+enum VerificationResult {
+  VALID
+  HASH_MISMATCH
+  NOT_FOUND
+  REVOKED
+}
+
+// ─── Immutable Audit Log ──────────────────────────────────────────────────────
+model AuditLog {
+  id          String    @id @default(uuid())
+  userId      String?   @map("user_id")
+  user        User?     @relation(fields: [userId], references: [id])
+  signatureId String?   @map("signature_id")
+  signature   Signature? @relation(fields: [signatureId], references: [id])
+
+  action      String
+  metadata    String?   // JSON string with extra context
+  ipAddress   String?   @map("ip_address")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@map("audit_logs")
+}
