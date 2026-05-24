@@ -3,9 +3,13 @@
  * POST /api/documents/upload  - Upload PDF, compute hash, store metadata
  * GET  /api/documents         - List user's documents
  * GET  /api/documents/:id     - Get single document
+ * GET  /api/documents/:id/pages - Get PDF pages as base64 images
  */
 
 const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+const sharp = require('sharp');
 const prisma = require('../prisma/client');
 const { sha256File } = require('../utils/crypto');
 const { extractIp } = require('../utils/geolocation');
@@ -19,11 +23,8 @@ async function uploadDocument(req, res, next) {
     }
 
     const { path: filePath, originalname, size } = req.file;
-
-    // Compute SHA-256 of the original PDF
     const sha256Original = await sha256File(filePath);
 
-    // Persist to DB
     const document = await prisma.document.create({
       data: {
         originalName: originalname,
@@ -59,10 +60,91 @@ async function uploadDocument(req, res, next) {
       },
     });
   } catch (err) {
-    // Clean up uploaded file on error
     if (req.file?.path && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
+    next(err);
+  }
+}
+
+// ─── Get PDF Pages as Images ──────────────────────────────────────────────────
+async function getDocumentPages(req, res, next) {
+  try {
+    const document = await prisma.document.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!document) {
+      return res.status(404).json({ error: 'Documento no encontrado.' });
+    }
+
+    if (!fs.existsSync(document.storagePath)) {
+      return res.status(404).json({ error: 'Archivo PDF no encontrado.' });
+    }
+
+    // Create temp directory for page images
+    const tempDir = path.join(process.cwd(), 'uploads', 'temp', document.id);
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    // Convert PDF pages to PNG using pdftoppm (poppler)
+    // Falls back to a placeholder if poppler not available
+    let pages = [];
+
+    try {
+      // Try pdftoppm first (Linux/Railway has this)
+      const outputPrefix = path.join(tempDir, 'page');
+      execSync(`pdftoppm -png -r 150 "${document.storagePath}" "${outputPrefix}"`, {
+        timeout: 30000,
+      });
+
+      // Read generated images
+      const files = fs.readdirSync(tempDir)
+        .filter(f => f.endsWith('.png'))
+        .sort();
+
+      for (let i = 0; i < files.length; i++) {
+        const filePath = path.join(tempDir, files[i]);
+        const imgBuffer = fs.readFileSync(filePath);
+
+        // Resize to max width 800px for mobile
+        const resized = await sharp(imgBuffer)
+          .resize({ width: 800, withoutEnlargement: true })
+          .png({ quality: 85 })
+          .toBuffer();
+
+        const base64 = resized.toString('base64');
+        const dimensions = await sharp(resized).metadata();
+
+        pages.push({
+          page: i + 1,
+          base64: `data:image/png;base64,${base64}`,
+          width: dimensions.width,
+          height: dimensions.height,
+        });
+
+        // Clean up temp file
+        fs.unlinkSync(filePath);
+      }
+    } catch (err) {
+      logger.warn('pdftoppm failed, using placeholder', { error: err.message });
+
+      // Fallback: return placeholder with PDF dimensions
+      pages = [{
+        page: 1,
+        base64: null,
+        width: 595,
+        height: 842,
+        placeholder: true,
+      }];
+    }
+
+    // Clean up temp dir
+    try { fs.rmdirSync(tempDir); } catch {}
+
+    return res.json({ pages, totalPages: pages.length });
+  } catch (err) {
     next(err);
   }
 }
@@ -74,7 +156,6 @@ async function listDocuments(req, res, next) {
     const limit = parseInt(req.query.limit || '20', 10);
     const skip  = (page - 1) * limit;
 
-    // Only return documents that have at least one signature by this user
     const [documents, total] = await Promise.all([
       prisma.document.findMany({
         where: {
@@ -130,4 +211,4 @@ async function getDocument(req, res, next) {
   }
 }
 
-module.exports = { uploadDocument, listDocuments, getDocument };
+module.exports = { uploadDocument, listDocuments, getDocument, getDocumentPages };
