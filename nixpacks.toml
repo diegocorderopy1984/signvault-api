@@ -1,7 +1,7 @@
 [phases.setup]
-nixPkgs = ["nodejs_18", "ghostscript", "graphicsmagick"]
+nixPkgs = ["nodejs_18", "graphicsmagick", "ghostscript"]
 
-[phases.build]
+[phases.install]
 cmds = ["npm install"]
 
 [start]
