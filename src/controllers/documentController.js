@@ -1,6 +1,5 @@
 const fs = require('fs');
 const path = require('path');
-const sharp = require('sharp');
 const prisma = require('../prisma/client');
 const { sha256File } = require('../utils/crypto');
 const { extractIp } = require('../utils/geolocation');
@@ -64,39 +63,39 @@ async function getDocumentPages(req, res, next) {
       return res.status(404).json({ error: 'Archivo PDF no encontrado.' });
     }
 
-    const tempDir = path.join(process.cwd(), 'uploads', 'temp', document.id);
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
-    }
-
     let pages = [];
 
     try {
-      const { fromPath } = require('pdf2pic');
-      const converter = fromPath(document.storagePath, {
-        density: 150,
-        saveFilename: 'page',
-        savePath: tempDir,
-        format: 'png',
-        width: 800,
-        height: 1200,
-      });
+      const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+      const { createCanvas } = require('canvas');
 
-      const results = await converter.bulk(-1, { responseType: 'base64' });
+      const data = new Uint8Array(fs.readFileSync(document.storagePath));
+      const loadingTask = pdfjsLib.getDocument({ data });
+      const pdfDocument = await loadingTask.promise;
+      const numPages = pdfDocument.numPages;
 
-      for (let i = 0; i < results.length; i++) {
-        const result = results[i];
-        if (result.base64) {
-          pages.push({
-            page: i + 1,
-            base64: `data:image/png;base64,${result.base64}`,
-            width: 800,
-            height: 1131,
-          });
-        }
+      for (let i = 1; i <= numPages; i++) {
+        const page = await pdfDocument.getPage(i);
+        const viewport = page.getViewport({ scale: 1.5 });
+
+        const canvas = createCanvas(viewport.width, viewport.height);
+        const context = canvas.getContext('2d');
+
+        await page.render({
+          canvasContext: context,
+          viewport,
+        }).promise;
+
+        const base64 = canvas.toDataURL('image/png');
+        pages.push({
+          page: i,
+          base64,
+          width: Math.round(viewport.width),
+          height: Math.round(viewport.height),
+        });
       }
     } catch (err) {
-      logger.warn('pdf2pic failed, using placeholder', { error: err.message });
+      logger.warn('pdfjs failed, using placeholder', { error: err.message });
       pages = [{
         page: 1,
         base64: null,
@@ -105,16 +104,6 @@ async function getDocumentPages(req, res, next) {
         placeholder: true,
       }];
     }
-
-    try {
-      if (fs.existsSync(tempDir)) {
-        const files = fs.readdirSync(tempDir);
-        files.forEach(f => {
-          try { fs.unlinkSync(path.join(tempDir, f)); } catch {}
-        });
-        fs.rmdirSync(tempDir);
-      }
-    } catch {}
 
     return res.json({ pages, totalPages: pages.length });
   } catch (err) {

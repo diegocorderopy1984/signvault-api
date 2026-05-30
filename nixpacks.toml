@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs_18", "graphicsmagick", "ghostscript"]
+nixPkgs = ["nodejs_18", "cairo", "pango", "libjpeg", "giflib", "librsvg", "pixman"]
 
 [phases.install]
 cmds = ["npm install"]
