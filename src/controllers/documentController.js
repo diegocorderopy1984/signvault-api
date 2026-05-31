@@ -282,4 +282,4 @@ async function getSignature(req, res, next) {
   }
 }
 
-module.exports = { signDocument, listSignatures, getSignature };
+module.exports = { uploadDocument, listDocuments, getDocument, getDocumentPages };
