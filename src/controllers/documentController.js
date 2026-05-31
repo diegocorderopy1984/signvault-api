@@ -66,7 +66,7 @@ async function getDocumentPages(req, res, next) {
     let pages = [];
 
     try {
-      const pdfjsLib = require('pdfjs-dist');
+      const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
       const { createCanvas } = require('canvas');
       const data = new Uint8Array(fs.readFileSync(document.storagePath));
       const loadingTask = pdfjsLib.getDocument({ data });

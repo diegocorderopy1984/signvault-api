@@ -26,7 +26,7 @@
     "pdf-lib": "^1.17.1",
     "pdf-poppler": "^0.2.3",
     "pdf2pic": "^3.2.0",
-    "pdfjs-dist": "^6.0.227",
+    "pdfjs-dist": "^2.16.105",
     "qrcode": "^1.5.3",
     "sharp": "^0.33.5",
     "uuid": "^9.0.0",
