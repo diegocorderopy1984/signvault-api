@@ -1,154 +1,250 @@
 const fs = require('fs');
 const path = require('path');
-const prisma = require('../prisma/client');
-const { sha256File } = require('../utils/crypto');
-const { extractIp } = require('../utils/geolocation');
-const logger = require('../utils/logger');
+const { v4: uuidv4 } = require('uuid');
 
-async function uploadDocument(req, res, next) {
+const prisma          = require('../prisma/client');
+const { encrypt }     = require('../utils/crypto');
+const { reverseGeocode, geolocateByIp, extractIp } = require('../utils/geolocation');
+const { embedSignatureInPdf, saveQrCode, savePdf } = require('../services/pdfService');
+const logger          = require('../utils/logger');
+
+async function signDocument(req, res, next) {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'Se requiere un archivo PDF.' });
-    }
-    const { path: filePath, originalname, size } = req.file;
-    const sha256Original = await sha256File(filePath);
-    const document = await prisma.document.create({
-      data: {
-        originalName: originalname,
-        storagePath: filePath,
-        sha256Original,
-        sizeBytes: size,
-      },
-    });
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user.id,
-        action: 'DOCUMENT_UPLOADED',
-        ipAddress: extractIp(req),
-        metadata: JSON.stringify({
-          documentId: document.id,
-          originalName: originalname,
-          sha256Original,
-          sizeBytes: size,
-        }),
-      },
-    });
-    logger.info('Document uploaded', { documentId: document.id, userId: req.user.id });
-    return res.status(201).json({
-      document: {
-        id: document.id,
-        originalName: document.originalName,
-        sha256Original: document.sha256Original,
-        sizeBytes: document.sizeBytes,
-        uploadedAt: document.uploadedAt,
-      },
-    });
-  } catch (err) {
-    if (req.file?.path && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
-    next(err);
-  }
-}
+    const {
+      documentId,
+      signatureDataUrl,
+      x = 50,
+      y = 100,
+      page = 1,
+      width = 150,
+      height = 60,
+      placements,
+      latitude,
+      longitude,
+      accuracyMeters,
+      address: clientAddress,
+      geoSource = 'NONE',
+    } = req.body;
 
-async function getDocumentPages(req, res, next) {
-  try {
-    const document = await prisma.document.findUnique({
-      where: { id: req.params.id },
-    });
-    if (!document) {
-      return res.status(404).json({ error: 'Documento no encontrado.' });
-    }
-    if (!fs.existsSync(document.storagePath)) {
-      return res.status(404).json({ error: 'Archivo PDF no encontrado.' });
-    }
+    if (!documentId) return res.status(400).json({ error: 'documentId es requerido.' });
+    if (!signatureDataUrl) return res.status(400).json({ error: 'La firma es requerida.' });
+    if (!signatureDataUrl.startsWith('data:image/')) return res.status(400).json({ error: 'Formato de firma inválido.' });
 
-    let pages = [];
+    const document = await prisma.document.findUnique({ where: { id: documentId } });
+    if (!document) return res.status(404).json({ error: 'Documento no encontrado.' });
+    if (!fs.existsSync(document.storagePath)) return res.status(404).json({ error: 'Archivo PDF no encontrado.' });
 
-    try {
-      const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
-      const { createCanvas } = require('canvas');
+    let pdfBuffer = fs.readFileSync(document.storagePath);
 
-      const data = new Uint8Array(fs.readFileSync(document.storagePath));
-      const loadingTask = pdfjsLib.getDocument({ data });
-      const pdfDocument = await loadingTask.promise;
-      const numPages = pdfDocument.numPages;
+    let finalLat = latitude ? parseFloat(latitude) : null;
+    let finalLon = longitude ? parseFloat(longitude) : null;
+    let finalAccuracy = accuracyMeters ? parseFloat(accuracyMeters) : null;
+    let finalAddress = clientAddress || null;
+    let finalGeoSource = geoSource;
 
-      for (let i = 1; i <= numPages; i++) {
-        const page = await pdfDocument.getPage(i);
-        const viewport = page.getViewport({ scale: 1.5 });
-        const canvas = createCanvas(viewport.width, viewport.height);
-        const context = canvas.getContext('2d');
-        await page.render({ canvasContext: context, viewport }).promise;
-        const base64 = canvas.toDataURL('image/png');
-        pages.push({
-          page: i,
-          base64,
-          width: Math.round(viewport.width),
-          height: Math.round(viewport.height),
-        });
+    if (!finalLat || !finalLon) {
+      const ip = extractIp(req);
+      const ipGeo = await geolocateByIp(ip);
+      if (ipGeo) {
+        finalLat = ipGeo.lat;
+        finalLon = ipGeo.lon;
+        finalAddress = ipGeo.address;
+        finalGeoSource = 'IP';
       }
-    } catch (err) {
-      logger.warn('pdfjs failed, using placeholder', { error: err.message });
-      pages = [{
-        page: 1,
-        base64: null,
-        width: 595,
-        height: 842,
-        placeholder: true,
+    }
+
+    if (finalLat && finalLon && !finalAddress) {
+      finalAddress = await reverseGeocode(finalLat, finalLon);
+    }
+
+    const ip = extractIp(req);
+    const userAgent = req.headers['user-agent'] || '';
+    const deviceInfo = JSON.stringify({
+      platform: req.headers['sec-ch-ua-platform'] || '',
+      mobile: req.headers['sec-ch-ua-mobile'] || '',
+      browser: req.headers['sec-ch-ua'] || '',
+    });
+
+    const { encrypted: signatureDataEncrypted, iv: signatureIv } = encrypt(signatureDataUrl);
+    const verificationCode = uuidv4();
+    const { path: qrPath, buffer: qrBuffer } = await saveQrCode(verificationCode);
+
+    let signaturePlacements = [];
+    if (placements && Array.isArray(placements) && placements.length > 0) {
+      signaturePlacements = placements;
+    } else {
+      signaturePlacements = [{
+        page: parseInt(page, 10),
+        x: parseFloat(x),
+        y: parseFloat(y),
+        width: parseFloat(width),
+        height: parseFloat(height),
       }];
     }
 
-    return res.json({ pages, totalPages: pages.length });
+    let currentPdfBuffer = pdfBuffer;
+    let sha256Signed = null;
+
+    for (let i = 0; i < signaturePlacements.length; i++) {
+      const placement = signaturePlacements[i];
+      const isLast = i === signaturePlacements.length - 1;
+
+      const result = await embedSignatureInPdf({
+        pdfBuffer: currentPdfBuffer,
+        signatureDataUrl,
+        x: parseFloat(placement.x),
+        y: parseFloat(placement.y),
+        page: parseInt(placement.page, 10),
+        width: parseFloat(placement.width || width),
+        height: parseFloat(placement.height || height),
+        signerName: req.user.name,
+        signedAt: new Date().toISOString(),
+        verificationCode,
+        qrBuffer: isLast ? qrBuffer : null,
+      });
+
+      currentPdfBuffer = result.pdfBuffer;
+      if (isLast) sha256Signed = result.sha256;
+    }
+
+    const signedFilename = `signed_${verificationCode}.pdf`;
+    const signedPdfPath = savePdf(currentPdfBuffer, signedFilename);
+    const primaryPlacement = signaturePlacements[0];
+
+    const signature = await prisma.signature.create({
+      data: {
+        verificationCode,
+        userId: req.user.id,
+        documentId: document.id,
+        signedPdfPath,
+        sha256Signed,
+        signatureDataEncrypted,
+        signatureIv,
+        signatureX: parseFloat(primaryPlacement.x),
+        signatureY: parseFloat(primaryPlacement.y),
+        signaturePage: parseInt(primaryPlacement.page, 10),
+        signatureWidth: parseFloat(primaryPlacement.width || width),
+        signatureHeight: parseFloat(primaryPlacement.height || height),
+        qrCodePath: qrPath,
+        latitude: finalLat,
+        longitude: finalLon,
+        accuracyMeters: finalAccuracy,
+        address: finalAddress,
+        geoSource: finalGeoSource,
+        ipAddress: ip,
+        userAgent,
+        deviceInfo,
+      },
+      include: {
+        user: { select: { id: true, name: true, email: true } },
+        document: { select: { id: true, originalName: true, sha256Original: true } },
+      },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user.id,
+        signatureId: signature.id,
+        action: 'DOCUMENT_SIGNED',
+        ipAddress: ip,
+        metadata: JSON.stringify({
+          documentId: document.id,
+          verificationCode,
+          sha256Signed,
+          geoSource: finalGeoSource,
+          placements: signaturePlacements,
+        }),
+      },
+    });
+
+    logger.info('Document signed', {
+      signatureId: signature.id,
+      userId: req.user.id,
+      documentId: document.id,
+      verificationCode,
+      totalPlacements: signaturePlacements.length,
+    });
+
+    return res.status(201).json({
+      signature: {
+        id: signature.id,
+        verificationCode: signature.verificationCode,
+        sha256Signed: signature.sha256Signed,
+        signedAt: signature.signedAt,
+        status: signature.status,
+        qrUrl: `${process.env.PUBLIC_URL}/uploads/qr/qr_${verificationCode}.png`,
+        verifyUrl: `${process.env.FRONTEND_URL}/verificar/${verificationCode}`,
+        downloadUrl: `${process.env.PUBLIC_URL}/uploads/signed/${signedFilename}`,
+        totalPlacements: signaturePlacements.length,
+        geolocation: {
+          latitude: finalLat,
+          longitude: finalLon,
+          accuracy: finalAccuracy,
+          address: finalAddress,
+          source: finalGeoSource,
+        },
+        document: signature.document,
+        user: signature.user,
+      },
+    });
   } catch (err) {
     next(err);
   }
 }
 
-async function listDocuments(req, res, next) {
+async function listSignatures(req, res, next) {
   try {
     const page  = parseInt(req.query.page  || '1', 10);
     const limit = parseInt(req.query.limit || '20', 10);
     const skip  = (page - 1) * limit;
-    const [documents, total] = await Promise.all([
-      prisma.document.findMany({
-        where: { signatures: { some: { userId: req.user.id } } },
+
+    const [signatures, total] = await Promise.all([
+      prisma.signature.findMany({
+        where: { userId: req.user.id },
         include: {
-          signatures: {
-            where: { userId: req.user.id },
-            select: { id: true, verificationCode: true, signedAt: true, status: true },
-            orderBy: { signedAt: 'desc' },
-          },
+          document: { select: { id: true, originalName: true, sha256Original: true, sizeBytes: true } },
         },
-        orderBy: { uploadedAt: 'desc' },
+        orderBy: { signedAt: 'desc' },
         skip,
         take: limit,
       }),
-      prisma.document.count({
-        where: { signatures: { some: { userId: req.user.id } } },
-      }),
+      prisma.signature.count({ where: { userId: req.user.id } }),
     ]);
-    return res.json({ documents, total, page, pages: Math.ceil(total / limit) });
+
+    const safe = signatures.map(({ signatureDataEncrypted, signatureIv, ...s }) => ({
+      ...s,
+      qrUrl: s.qrCodePath ? `${process.env.PUBLIC_URL}/uploads/qr/qr_${s.verificationCode}.png` : null,
+      downloadUrl: s.signedPdfPath ? `${process.env.PUBLIC_URL}/uploads/signed/signed_${s.verificationCode}.pdf` : null,
+      verifyUrl: `${process.env.FRONTEND_URL}/verificar/${s.verificationCode}`,
+    }));
+
+    return res.json({ signatures: safe, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     next(err);
   }
 }
 
-async function getDocument(req, res, next) {
+async function getSignature(req, res, next) {
   try {
-    const document = await prisma.document.findUnique({
-      where: { id: req.params.id },
+    const signature = await prisma.signature.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
       include: {
-        signatures: {
-          where: { userId: req.user.id },
-          select: { id: true, verificationCode: true, signedAt: true, status: true, sha256Signed: true },
-        },
+        document: true,
+        user: { select: { id: true, name: true, email: true } },
       },
     });
-    if (!document) {
-      return res.status(404).json({ error: 'Documento no encontrado.' });
-    }
-    return res.json({ document });
+
+    if (!signature) return res.status(404).json({ error: 'Firma no encontrada.' });
+
+    const { signatureDataEncrypted, signatureIv, ...safe } = signature;
+    return res.json({
+      signature: {
+        ...safe,
+        qrUrl: `${process.env.PUBLIC_URL}/uploads/qr/qr_${signature.verificationCode}.png`,
+        downloadUrl: `${process.env.PUBLIC_URL}/uploads/signed/signed_${signature.verificationCode}.pdf`,
+        verifyUrl: `${process.env.FRONTEND_URL}/verificar/${signature.verificationCode}`,
+      },
+    });
   } catch (err) {
     next(err);
   }
