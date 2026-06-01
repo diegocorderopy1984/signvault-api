@@ -154,4 +154,4 @@ async function getDocument(req, res, next) {
   }
 }
 
-module.exports = { uploadDocument, listDocuments, getDocument, getDocumentPages };
+module.exports = { signDocument, listSignatures, getSignature };
